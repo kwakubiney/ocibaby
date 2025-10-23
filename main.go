@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"sync/atomic"
+	"time"
 
 	"github.com/containerd/containerd"
 	"github.com/containerd/containerd/content"
@@ -139,29 +141,30 @@ func main() {
 		info, err := containerdClient.ContentStore().Info(ctx, entry)
 		if err == nil {
 			// blob exists locally
-			log.Println("Blob already present locally:", entry, "info:", info)
+			log.Printf("Blob already present locally: %s\n  info: %+v", entry, info)
 			continue
 		}
 
 		// If it's some error other than NotFound, log and continue
 		if !errdefs.IsNotFound(err) {
-			log.Println("Error getting content info for", entry, ":", err)
+			log.Printf("Error getting content info for %s: %v", entry, err)
 			continue
 		}
 
 		// Not found -> fetch
-		log.Println("Content info for", entry, "not found locally. Proceeding to fetch.")
+		log.Printf("Content info for %s not found locally. Proceeding to fetch.", entry)
 		if err := fetchAndStreamBlob(ctx, containerdClient.ContentStore(), token, "library/alpine", entry); err != nil {
-			log.Println("Error fetching and streaming blob", entry, ":", err)
+			log.Printf("Error fetching and streaming blob %s: %v", entry, err)
 			continue
 		}
 
 		// Verify it was written
 		info, err = containerdClient.ContentStore().Info(ctx, entry)
 		if err != nil {
-			log.Println("Fetch succeeded but Info failed for", entry, ":", err)
+			log.Printf("Fetch succeeded but Info failed for %s: %v", entry, err)
 		} else {
-			log.Println("Successfully stored blob:", entry, "info:", info)
+			log.Printf("Successfully stored blob %s: size=%d created=%s updated=%s labels=%v", info.Digest, info.Size, info.CreatedAt, info.UpdatedAt, info.Labels)
+
 		}
 	}
 }
@@ -260,7 +263,8 @@ func FetchManifest(token, imageName, tag string) (configDigest string, layerDige
 		}
 		defer resp.Body.Close()
 		if resp.StatusCode != http.StatusOK {
-			return nil, "", fmt.Errorf("manifest request failed: %s", resp.Status)
+			b, _ := io.ReadAll(resp.Body)
+			return nil, "", fmt.Errorf("manifest request failed: %s %s", resp.Status, strings.TrimSpace(string(b)))
 		}
 		ct := resp.Header.Get("Content-Type")
 		b, err := io.ReadAll(resp.Body)
@@ -356,6 +360,8 @@ func FetchManifest(token, imageName, tag string) (configDigest string, layerDige
 			return "", nil, fmt.Errorf("no matching manifest for platform %s/%s", targetOS, targetArch)
 		}
 
+		log.Printf("Selected manifest from index: digest=%s mediaType=%s", chosen.Digest, chosen.MediaType)
+
 		b, ct, err = get(string(chosen.Digest))
 		if err != nil {
 			return "", nil, err
@@ -382,16 +388,40 @@ func FetchManifest(token, imageName, tag string) (configDigest string, layerDige
 	return configDigest, layerDigests, nil
 }
 
+// progressReader wraps a reader and logs progress periodically.
+type progressReader struct {
+	r     io.Reader
+	dgst  digest.Digest
+	total int64
+	last  time.Time
+}
+
+func (p *progressReader) Read(b []byte) (int, error) {
+	n, err := p.r.Read(b)
+	if n > 0 {
+		atomic.AddInt64(&p.total, int64(n))
+	}
+	if time.Since(p.last) > 2*time.Second {
+		p.last = time.Now()
+		log.Printf("downloading %s: %d bytes transferred", p.dgst, atomic.LoadInt64(&p.total))
+	}
+	return n, err
+}
+
 // Call this from the loop where you currently have the TODO.
 // imageName should be the repository name (e.g. "library/alpine").
 func fetchAndStreamBlob(ctx context.Context, cs content.Store, token, imageName string, dgst digest.Digest) error {
 	blobUrl := "https://" + defaultUrl + "/v2/" + imageName + "/blobs/" + dgst.String()
+	log.Printf("fetchAndStreamBlob: GET %s (image=%s digest=%s)", blobUrl, imageName, dgst)
 	req, err := http.NewRequest("GET", blobUrl, nil)
 	if err != nil {
 		return err
 	}
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
+		log.Println("Authorization: (present)")
+	} else {
+		log.Println("Authorization: (absent)")
 	}
 	// optional: request chunked transfer or any particular Accept if needed
 	req.Header.Set("Accept", "*/*")
@@ -403,15 +433,27 @@ func fetchAndStreamBlob(ctx context.Context, cs content.Store, token, imageName 
 	}
 	defer resp.Body.Close()
 
+	log.Printf("blob response status: %s", resp.Status)
+	for k, v := range resp.Header {
+		log.Printf("response header: %s=%s", k, strings.Join(v, ","))
+	}
+
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("blob GET %s: %s %s", dgst.String(), resp.Status, strings.TrimSpace(string(b)))
 	}
 
 	contentlength := resp.Header.Get("Content-Length")
-	sizeInBytes, err := strconv.ParseInt(contentlength, 10, 64)
-	if err != nil {
-		return fmt.Errorf("error parsing content length: %v", err)
+	var sizeInBytes int64
+	if contentlength == "" {
+		log.Printf("Content-Length header absent for %s: proceeding without known size", dgst)
+		sizeInBytes = 0
+	} else {
+		sizeInBytes, err = strconv.ParseInt(contentlength, 10, 64)
+		if err != nil {
+			log.Printf("warning: error parsing content length '%s' for %s: %v; proceeding with size=0", contentlength, dgst, err)
+			sizeInBytes = 0
+		}
 	}
 
 	desc := v1.Descriptor{
@@ -420,6 +462,15 @@ func fetchAndStreamBlob(ctx context.Context, cs content.Store, token, imageName 
 		Size:      sizeInBytes,
 	}
 
-	err = content.WriteBlob(ctx, cs, imageName, resp.Body, desc)
-	return err
+	pr := &progressReader{r: resp.Body, dgst: dgst, last: time.Now()}
+
+	log.Printf("Starting WriteBlob for %s (size=%d, mediaType=%s)", dgst, desc.Size, desc.MediaType)
+	err = content.WriteBlob(ctx, cs, imageName, pr, desc)
+	if err != nil {
+		log.Printf("WriteBlob error for %s: %v", dgst, err)
+		return err
+	}
+
+	log.Printf("WriteBlob completed for %s, bytes transferred=%d", dgst, atomic.LoadInt64(&pr.total))
+	return nil
 }
