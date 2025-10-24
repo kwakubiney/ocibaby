@@ -2,7 +2,10 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"strconv"
 	"sync/atomic"
@@ -65,9 +68,27 @@ type Manifest struct {
 	Layers        []Descriptor `json:"layers"`
 }
 
-var defaultUrl = "registry-1.docker.io"
+var defaultUrl string
+
+func generateShortID() string {
+	b := make([]byte, 8)
+	rand.Read(b)
+	return hex.EncodeToString(b)
+}
 
 func main() {
+
+	registry := flag.String("registry", "registry-1.docker.io", "Docker registry URL")
+	image := flag.String("image", "", "Image name (e.g., library/alpine)")
+	tag := flag.String("tag", "latest", "Image tag")
+	name := flag.String("name", "", "Container name (optional, stored as metadata)")
+	flag.Parse()
+
+	if *image == "" {
+		log.Fatal("image is required")
+	}
+
+	defaultUrl = *registry
 
 	var ctx = context.Background()
 	ctxWithNamespace := namespaces.WithNamespace(ctx, "default")
@@ -89,8 +110,6 @@ func main() {
 			}
 		}
 	}()
-
-	println("Default Docker Registry URL is:", defaultUrl)
 
 	urlStr := "https://" + defaultUrl + "/v2/"
 	println("Docker Registry V2 API endpoint is:", urlStr)
@@ -119,8 +138,7 @@ func main() {
 		log.Println("WWW-Authenticate:", www)
 		log.Println("Received 401 Unauthorized. Token authentication required.")
 
-		// For official images use the "library/<name>" repository namespace
-		repo := "library/alpine"
+		repo := *image
 		tok, err := getTokenFromWWW(www, repo, "pull")
 		if err != nil {
 			log.Println(os.Stderr, "Error getting token:", err)
@@ -129,7 +147,6 @@ func main() {
 		token = tok
 
 	} else if resp.StatusCode == http.StatusOK {
-		// Anonymous access allowed; proceed without token
 		log.Println("Registry returned 200 OK; proceeding anonymously (no token)")
 	} else {
 		log.Println(os.Stderr, "Unexpected response from registry:", resp.Status)
@@ -138,12 +155,16 @@ func main() {
 
 	fmt.Println("Bearer token:", token)
 
-	// Use the official library namespace for alpine
-	configDesc, layers, manifestBytes, mediaType, err := FetchManifest(token, "library/alpine", "latest")
+	configDesc, layers, manifestBytes, mediaType, err := FetchManifest(token, *image, *tag)
 	if err != nil {
 		log.Println(os.Stderr, "FetchManifest error:", err)
 		os.Exit(1)
 	}
+
+	manifestDigest := digest.FromBytes(manifestBytes)
+	containerID := generateShortID()
+	snapshotKey := fmt.Sprintf("sha256:%s-%s", manifestDigest, generateShortID())
+	userName := *name
 
 	fmt.Println("Config digest:", configDesc.Digest)
 	fmt.Println("Layers:")
@@ -171,7 +192,7 @@ func main() {
 
 		// Not found -> fetch
 		log.Printf("Content info for %s not found locally. Proceeding to fetch.", entry.Digest)
-		if err := fetchAndStreamBlob(ctx, cs, token, "library/alpine", entry.Digest, entry.MediaType); err != nil {
+		if err := fetchAndStreamBlob(ctx, cs, token, *registry, *image, entry.Digest, entry.MediaType); err != nil {
 			log.Printf("Error fetching and streaming blob %s: %v", entry.Digest, err)
 			continue
 		}
@@ -200,7 +221,7 @@ func main() {
 			if cfgMT == "" {
 				cfgMT = "application/vnd.oci.image.config.v1+json"
 			}
-			if err := fetchAndStreamBlob(ctx, cs, token, "library/alpine", configDesc.Digest, cfgMT); err != nil {
+			if err := fetchAndStreamBlob(ctx, cs, token, *registry, *image, configDesc.Digest, cfgMT); err != nil {
 				log.Printf("Error fetching config blob %s: %v", configDesc.Digest, err)
 			} else {
 				info, _ := cs.Info(ctx, configDesc.Digest)
@@ -214,7 +235,8 @@ func main() {
 		log.Println("manifest bytes empty; skipping manifest write")
 	} else {
 		manifestDigest := digest.FromBytes(manifestBytes)
-		ref := fmt.Sprintf("docker.io/%s@%s", "library/alpine", manifestDigest)
+		fullImageName := fmt.Sprintf("%s/%s", *registry, *image)
+		ref := fmt.Sprintf("%s@%s", fullImageName, manifestDigest)
 		log.Printf("Writing manifest blob to content store: ref=%s mediaType=%s size=%d", ref, mediaType, len(manifestBytes))
 
 		manifestDescriptor := v1.Descriptor{
@@ -263,12 +285,12 @@ func main() {
 			}
 		}
 
-		err = registerImage(ctx, containerdClient, manifestDescriptor, "docker.io/library/alpine")
+		err = registerImage(ctx, containerdClient, manifestDescriptor, fullImageName)
 		if err != nil {
 			log.Printf("Error registering image in containerd: %v", err)
 		}
 
-		image, err := containerdClient.GetImage(ctx, "docker.io/library/alpine")
+		image, err := containerdClient.GetImage(ctx, fullImageName)
 		if err != nil {
 			log.Printf("Error retrieving image from containerd: %v", err)
 		}
@@ -280,12 +302,9 @@ func main() {
 
 		container, err := containerdClient.NewContainer(
 			ctx,
-			"my-alpine-container",
-			containerd.WithNewSnapshot("my-alpine-container-snap", image),
-			containerd.WithNewSpec(
-				oci.WithImageConfig(image),
-				oci.WithProcessArgs("/bin/sh", "-c", "echo hello && sleep 30"),
-			),
+			containerID,
+			containerd.WithNewSnapshot(snapshotKey, image),
+			containerd.WithNewSpec(oci.WithImageConfig(image)),
 		)
 
 		if err != nil {
@@ -572,8 +591,8 @@ func (p *progressReader) Read(b []byte) (int, error) {
 }
 
 // imageName should be the repository name (e.g. "library/alpine").
-func fetchAndStreamBlob(ctx context.Context, cs content.Store, token, imageName string, dgst digest.Digest, mediaType string) error {
-	blobUrl := "https://" + defaultUrl + "/v2/" + imageName + "/blobs/" + dgst.String()
+func fetchAndStreamBlob(ctx context.Context, cs content.Store, token, registry, imageName string, dgst digest.Digest, mediaType string) error {
+	blobUrl := "https://" + registry + "/v2/" + imageName + "/blobs/" + dgst.String()
 	log.Printf("fetchAndStreamBlob: GET %s (image=%s digest=%s)", blobUrl, imageName, dgst)
 	req, err := http.NewRequest("GET", blobUrl, nil)
 	if err != nil {
@@ -585,7 +604,6 @@ func fetchAndStreamBlob(ctx context.Context, cs content.Store, token, imageName 
 	} else {
 		log.Println("Authorization: (absent)")
 	}
-	// optional: request chunked transfer or any particular Accept if needed
 	req.Header.Set("Accept", "*/*")
 
 	client := &http.Client{}
@@ -609,7 +627,7 @@ func fetchAndStreamBlob(ctx context.Context, cs content.Store, token, imageName 
 		return fmt.Errorf("blob GET %s: %s %s", dgst.String(), resp.Status, strings.TrimSpace(string(b)))
 	}
 
-	ref := fmt.Sprintf("docker.io/%s@%s", imageName, dgst.String())
+	ref := fmt.Sprintf("%s/%s@%s", registry, imageName, dgst.String())
 	contentLength := resp.Header.Get("Content-Length")
 	var expectedSize int64
 	if contentLength == "" {
@@ -623,7 +641,6 @@ func fetchAndStreamBlob(ctx context.Context, cs content.Store, token, imageName 
 		}
 	}
 
-	// wrap body with progress reader to provide periodic updates
 	pr := &progressReader{r: resp.Body, dgst: dgst}
 
 	writer, err := content.OpenWriter(ctx, cs, content.WithRef(ref), content.WithDescriptor(v1.Descriptor{
@@ -648,15 +665,8 @@ func fetchAndStreamBlob(ctx context.Context, cs content.Store, token, imageName 
 	}()
 
 	n, err := io.Copy(writer, pr)
+	err = writer.Commit(ctx, n, dgst)
 	if err != nil {
-		_ = writer.Close()
-		if aerr := cs.Abort(ctx, ref); aerr != nil {
-			log.Printf("error aborting blob write (ref=%s): %v", ref, aerr)
-		}
-		return fmt.Errorf("failed to copy data for %s: %w", dgst, err)
-	}
-
-	if err := writer.Commit(ctx, n, dgst); err != nil {
 		if errdefs.IsAlreadyExists(err) {
 			log.Printf("Content %s already exists (caught during Commit)", dgst)
 			return nil
