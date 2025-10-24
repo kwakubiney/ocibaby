@@ -274,56 +274,41 @@ func main() {
 		}
 
 		container, err := containerdClient.NewContainer(ctx, "my-alpine-container", containerd.WithImage(image),
-			containerd.WithSnapshot("snap1"), containerd.WithNewSpec(oci.WithImageConfig(image), oci.WithProcessArgs("/bin/sh")))
+			containerd.WithNewSnapshot("snap1", image), containerd.WithNewSpec(oci.WithImageConfig(image), oci.WithProcessArgs("/bin/sh")))
 
 		if err != nil {
 			log.Printf("Error creating container: %v", err)
+			return
 		}
 
 		task, err := container.NewTask(ctx, cio.NewCreator(cio.WithStdio))
 		if err != nil {
 			log.Printf("Error creating task from container: %v", err)
+			return
 		}
 
 		if err := task.Start(ctx); err != nil {
 			log.Printf("Error starting task: %v", err)
+			return
 		}
 
 		exitChan, err := task.Wait(ctx)
 		if err != nil {
 			log.Printf("Error waiting on task: %v", err)
 		} else {
-			exitCodeCh := make(chan int, 1)
-			go func() {
-				select {
-				case status, ok := <-exitChan:
-					if !ok {
-						log.Printf("exit channel closed without a status")
-						exitCodeCh <- 1
-						return
-					}
-					code, _, err := status.Result()
-					if err != nil {
-						log.Printf("Error getting task result: %v", err)
-						exitCodeCh <- 1
-						return
-					}
-					log.Printf("Task exited with status: %d", code)
-					exitCodeCh <- int(code)
-				case <-ctx.Done():
-					log.Printf("Context canceled while waiting for task: %v", ctx.Err())
-					exitCodeCh <- 1
+			select {
+			case status, _ := <-exitChan:
+				code, _, err := status.Result()
+				if err != nil {
+					log.Printf("Error getting task result: %v", err)
+					code = 1
 				}
-			}()
-			code := <-exitCodeCh
-			if !leaseDone {
-				if derr := done(ctx); derr != nil {
-					log.Printf("lease done error: %v", derr)
-				}
-				leaseDone = true
+				log.Printf("Exiting process with code: %d", code)
+				os.Exit(int(code))
+			case <-ctx.Done():
+				log.Printf("Context canceled while waiting for task: %v", ctx.Err())
+				os.Exit(1)
 			}
-			log.Printf("Exiting process with code: %d", code)
-			os.Exit(code)
 		}
 	}
 }
