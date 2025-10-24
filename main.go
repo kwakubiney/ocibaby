@@ -72,7 +72,10 @@ var defaultUrl string
 
 func generateShortID() string {
 	b := make([]byte, 8)
-	rand.Read(b)
+	if _, err := rand.Read(b); err != nil {
+		// If secure random fails, log a warning and continue with whatever bytes we have.
+		log.Printf("warning: rand.Read failed: %v", err)
+	}
 	return hex.EncodeToString(b)
 }
 
@@ -84,6 +87,35 @@ func main() {
 
 	if *image == "" {
 		log.Fatal("image is required")
+	}
+
+	// If the user included a tag or digest in the image argument, split it out.
+	// Examples:
+	//  - "alpine:3.18" -> image="alpine", tag="3.18"
+	//  - "library/alpine@sha256:..." -> image="library/alpine", tag="sha256:..."
+	{
+		s := *image
+		lastSlash := strings.LastIndex(s, "/")
+		lastAt := strings.LastIndex(s, "@")
+		lastColon := strings.LastIndex(s, ":")
+
+		if lastAt > lastSlash {
+			// digest present after the last slash
+			*tag = s[lastAt+1:]
+			*image = s[:lastAt]
+		} else if lastColon > lastSlash {
+			// tag present after the last slash
+			*tag = s[lastColon+1:]
+			*image = s[:lastColon]
+		}
+	}
+
+	// If user provided just the image name (e.g., "alpine") assume Docker Hub
+	// official library and prepend "library/" so we use "library/alpine".
+	// If the user already provided a namespace (e.g., "user/alpine"), leave it alone.
+	if !strings.Contains(*image, "/") {
+		*image = "library/" + *image
+		log.Printf("No namespace provided for image; assuming Docker Hub official image -> %s", *image)
 	}
 
 	defaultUrl = "registry-1.docker.io"
@@ -99,7 +131,6 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// track whether we've already called done(ctx) so we don't call it twice
 	leaseDone := false
 	defer func() {
 		if !leaseDone {
