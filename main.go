@@ -67,7 +67,7 @@ var defaultUrl = "registry-1.docker.io"
 func main() {
 
 	var ctx = context.Background()
-	ctxWithNamespace := namespaces.WithNamespace(ctx, "ocibaby")
+	ctxWithNamespace := namespaces.WithNamespace(ctx, "default")
 	containerdClient, err := containerd.New("/run/containerd/containerd.sock")
 	if err != nil {
 		log.Fatal(err)
@@ -124,7 +124,7 @@ func main() {
 	fmt.Println("Bearer token:", token)
 
 	// Use the official library namespace for alpine
-	configDigest, layers, err := FetchManifest(token, "library/alpine", "latest")
+	configDigest, layers, mediaType, err := FetchManifest(token, "library/alpine", "latest")
 	if err != nil {
 		log.Println(os.Stderr, "FetchManifest error:", err)
 		os.Exit(1)
@@ -153,7 +153,7 @@ func main() {
 
 		// Not found -> fetch
 		log.Printf("Content info for %s not found locally. Proceeding to fetch.", entry)
-		if err := fetchAndStreamBlob(ctx, containerdClient.ContentStore(), token, "library/alpine", entry); err != nil {
+		if err := fetchAndStreamBlob(ctx, containerdClient.ContentStore(), token, "library/alpine", entry, mediaType); err != nil {
 			log.Printf("Error fetching and streaming blob %s: %v", entry, err)
 			continue
 		}
@@ -237,7 +237,7 @@ func getTokenFromWWW(www, repo, action string) (string, error) {
 	return "", fmt.Errorf("no token in response")
 }
 
-func FetchManifest(token, imageName, tag string) (configDigest string, layerDigests []digest.Digest, err error) {
+func FetchManifest(token, imageName, tag string) (configDigest string, layerDigests []digest.Digest, mediaType string, err error) {
 	accept := strings.Join([]string{
 		mediaManifestList,
 		mediaOCIIndex,
@@ -273,14 +273,14 @@ func FetchManifest(token, imageName, tag string) (configDigest string, layerDige
 
 	b, ct, err := get(tag)
 	if err != nil {
-		return "", nil, err
+		return "", nil, "", err
 	}
 	ct = strings.ToLower(ct)
 
 	if strings.Contains(ct, "manifest.list") || strings.Contains(ct, "index") {
 		var idx Index
 		if err := json.Unmarshal(b, &idx); err != nil {
-			return "", nil, fmt.Errorf("failed to decode index: %w", err)
+			return "", nil, "", fmt.Errorf("failed to decode index: %w", err)
 		}
 
 		targetOS := runtime.GOOS
@@ -357,25 +357,25 @@ func FetchManifest(token, imageName, tag string) (configDigest string, layerDige
 		}
 
 		if chosen == nil {
-			return "", nil, fmt.Errorf("no matching manifest for platform %s/%s", targetOS, targetArch)
+			return "", nil, "", fmt.Errorf("no matching manifest for platform %s/%s", targetOS, targetArch)
 		}
 
 		log.Printf("Selected manifest from index: digest=%s mediaType=%s", chosen.Digest, chosen.MediaType)
 
 		b, ct, err = get(string(chosen.Digest))
 		if err != nil {
-			return "", nil, err
+			return "", nil, "", err
 		}
 	}
 
 	// Parse manifest (single image manifest)
 	var m Manifest
 	if err := json.Unmarshal(b, &m); err != nil {
-		return "", nil, fmt.Errorf("failed to decode manifest: %w", err)
+		return "", nil, "", fmt.Errorf("failed to decode manifest: %w", err)
 	}
 
 	if m.Config.Digest == "" {
-		return "", nil, fmt.Errorf("manifest has no config digest")
+		return "", nil, "", fmt.Errorf("manifest has no config digest")
 	}
 
 	configDigest = string(m.Config.Digest)
@@ -385,7 +385,7 @@ func FetchManifest(token, imageName, tag string) (configDigest string, layerDige
 			layerDigests = append(layerDigests, l.Digest)
 		}
 	}
-	return configDigest, layerDigests, nil
+	return configDigest, layerDigests, mediaType, nil
 }
 
 // progressReader wraps a reader and logs progress periodically.
@@ -410,7 +410,7 @@ func (p *progressReader) Read(b []byte) (int, error) {
 
 // Call this from the loop where you currently have the TODO.
 // imageName should be the repository name (e.g. "library/alpine").
-func fetchAndStreamBlob(ctx context.Context, cs content.Store, token, imageName string, dgst digest.Digest) error {
+func fetchAndStreamBlob(ctx context.Context, cs content.Store, token, imageName string, dgst digest.Digest, mediaType string) error {
 	blobUrl := "https://" + defaultUrl + "/v2/" + imageName + "/blobs/" + dgst.String()
 	log.Printf("fetchAndStreamBlob: GET %s (image=%s digest=%s)", blobUrl, imageName, dgst)
 	req, err := http.NewRequest("GET", blobUrl, nil)
@@ -443,34 +443,53 @@ func fetchAndStreamBlob(ctx context.Context, cs content.Store, token, imageName 
 		return fmt.Errorf("blob GET %s: %s %s", dgst.String(), resp.Status, strings.TrimSpace(string(b)))
 	}
 
-	contentlength := resp.Header.Get("Content-Length")
-	var sizeInBytes int64
-	if contentlength == "" {
-		log.Printf("Content-Length header absent for %s: proceeding without known size", dgst)
-		sizeInBytes = 0
+	ref := fmt.Sprintf("docker.io/%s@%s", imageName, dgst.String())
+	contentLength := resp.Header.Get("Content-Length")
+	var expectedSize int64
+	if contentLength == "" {
+		log.Printf("Content-Length header absent for %s: will use actual bytes written", dgst)
+		expectedSize = 0
 	} else {
-		sizeInBytes, err = strconv.ParseInt(contentlength, 10, 64)
+		expectedSize, err = strconv.ParseInt(contentLength, 10, 64)
 		if err != nil {
-			log.Printf("warning: error parsing content length '%s' for %s: %v; proceeding with size=0", contentlength, dgst, err)
-			sizeInBytes = 0
+			log.Printf("warning: error parsing content length '%s' for %s: %v; will use actual bytes written", contentLength, dgst, err)
+			expectedSize = 0
 		}
 	}
 
-	desc := v1.Descriptor{
-		MediaType: resp.Header.Get("Content-Type"),
+	writer, err := content.OpenWriter(ctx, cs, content.WithRef(ref), content.WithDescriptor(v1.Descriptor{
+		MediaType: mediaType,
 		Digest:    dgst,
-		Size:      sizeInBytes,
-	}
+		Size:      expectedSize,
+	}))
 
-	pr := &progressReader{r: resp.Body, dgst: dgst, last: time.Now()}
-
-	log.Printf("Starting WriteBlob for %s (size=%d, mediaType=%s)", dgst, desc.Size, desc.MediaType)
-	err = content.WriteBlob(ctx, cs, imageName, pr, desc)
 	if err != nil {
-		log.Printf("WriteBlob error for %s: %v", dgst, err)
+		if errdefs.IsAlreadyExists(err) {
+			log.Printf("Blob %s already exists in content store (ref=%s); skipping download", dgst, ref)
+			return nil
+		}
+		log.Printf("Warning: error opening blob %s: %v", dgst, err)
 		return err
 	}
 
-	log.Printf("WriteBlob completed for %s, bytes transferred=%d", dgst, atomic.LoadInt64(&pr.total))
+	defer writer.Close()
+
+	n, err := io.Copy(writer, resp.Body)
+	if err != nil {
+		writer.Close()
+		cs.Abort(ctx, ref)
+		return fmt.Errorf("failed to copy data for %s: %w", dgst, err)
+	}
+
+	if err := writer.Commit(ctx, n, dgst, content.WithLabels(map[string]string{
+		"containerd.io/gc.ref.content.0": dgst.String(),
+	})); err != nil {
+		if errdefs.IsAlreadyExists(err) {
+			log.Printf("Content %s already exists (caught during Commit)", dgst)
+			return nil
+		}
+		return fmt.Errorf("failed to commit %s: %w", dgst, err)
+	}
+	log.Printf("Successfully committed blob %s to content store", dgst)
 	return nil
 }
