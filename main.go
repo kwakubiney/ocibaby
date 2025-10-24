@@ -18,7 +18,7 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"net/url"
+	neturl "net/url"
 	"os"
 	"runtime"
 	"strings"
@@ -77,7 +77,12 @@ func main() {
 		log.Fatal(err)
 	}
 
-	defer done(ctx)
+	// handle possible error returned by done
+	defer func() {
+		if derr := done(ctx); derr != nil {
+			log.Printf("lease done error: %v", derr)
+		}
+	}()
 
 	println("Default Docker Registry URL is:", defaultUrl)
 
@@ -96,7 +101,11 @@ func main() {
 		log.Println(os.Stderr, "Error making request:", err)
 		os.Exit(1)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if cerr := resp.Body.Close(); cerr != nil {
+			log.Printf("error closing registry v2 response body: %v", cerr)
+		}
+	}()
 
 	var token string
 	if resp.StatusCode == http.StatusUnauthorized {
@@ -124,47 +133,115 @@ func main() {
 	fmt.Println("Bearer token:", token)
 
 	// Use the official library namespace for alpine
-	configDigest, layers, mediaType, err := FetchManifest(token, "library/alpine", "latest")
+	configDesc, layers, manifestBytes, mediaType, err := FetchManifest(token, "library/alpine", "latest")
 	if err != nil {
 		log.Println(os.Stderr, "FetchManifest error:", err)
 		os.Exit(1)
 	}
 
-	fmt.Println("Config digest:", configDigest)
+	fmt.Println("Config digest:", configDesc.Digest)
 	fmt.Println("Layers:")
 	for _, d := range layers {
-		fmt.Println(" -", d)
+		fmt.Println(" -", d.Digest)
 	}
 
+	cs := containerdClient.ContentStore()
+
+	// Ensure layer blobs are present
 	for _, entry := range layers {
-		// Info expects a string reference
-		info, err := containerdClient.ContentStore().Info(ctx, entry)
+		// Info expects a digest or ref
+		info, err := cs.Info(ctx, entry.Digest)
 		if err == nil {
 			// blob exists locally
-			log.Printf("Blob already present locally: %s\n  info: %+v", entry, info)
+			log.Printf("Blob already present locally: %s\n  info: %+v", entry.Digest, info)
 			continue
 		}
 
 		// If it's some error other than NotFound, log and continue
 		if !errdefs.IsNotFound(err) {
-			log.Printf("Error getting content info for %s: %v", entry, err)
+			log.Printf("Error getting content info for %s: %v", entry.Digest, err)
 			continue
 		}
 
 		// Not found -> fetch
-		log.Printf("Content info for %s not found locally. Proceeding to fetch.", entry)
-		debugContentStore(ctx, containerdClient.ContentStore(), entry)
-		if err := fetchAndStreamBlob(ctx, containerdClient.ContentStore(), token, "library/alpine", entry, mediaType); err != nil {
-			log.Printf("Error fetching and streaming blob %s: %v", entry, err)
+		log.Printf("Content info for %s not found locally. Proceeding to fetch.", entry.Digest)
+		if err := fetchAndStreamBlob(ctx, cs, token, "library/alpine", entry.Digest, entry.MediaType); err != nil {
+			log.Printf("Error fetching and streaming blob %s: %v", entry.Digest, err)
 			continue
 		}
-		debugContentStore(ctx, containerdClient.ContentStore(), entry)
-		info, err = containerdClient.ContentStore().Info(ctx, entry)
+		info, err = cs.Info(ctx, entry.Digest)
 		if err != nil {
-			log.Printf("Fetch succeeded but Info failed for %s: %v", entry, err)
+			log.Printf("Fetch succeeded but Info failed for %s: %v", entry.Digest, err)
 		} else {
 			log.Printf("Successfully stored blob %s: size=%d created=%s updated=%s labels=%v", info.Digest, info.Size, info.CreatedAt, info.UpdatedAt, info.Labels)
 
+		}
+	}
+
+	// Ensure config blob is present
+	if configDesc.Digest == "" {
+		log.Println("No config descriptor found in manifest; skipping config fetch")
+	} else {
+		info, err := cs.Info(ctx, configDesc.Digest)
+		if err == nil {
+			log.Printf("Config blob already present locally: %s\n  info: %+v", configDesc.Digest, info)
+		} else if !errdefs.IsNotFound(err) {
+			log.Printf("Error checking config blob %s: %v", configDesc.Digest, err)
+		} else {
+			log.Printf("Config %s not found locally. Fetching...", configDesc.Digest)
+			cfgMT := configDesc.MediaType
+			if cfgMT == "" {
+				cfgMT = "application/vnd.oci.image.config.v1+json"
+			}
+			if err := fetchAndStreamBlob(ctx, cs, token, "library/alpine", configDesc.Digest, cfgMT); err != nil {
+				log.Printf("Error fetching config blob %s: %v", configDesc.Digest, err)
+			} else {
+				info, _ := cs.Info(ctx, configDesc.Digest)
+				log.Printf("Successfully stored config blob %s: %+v", configDesc.Digest, info)
+			}
+		}
+	}
+
+	// Finally write the manifest itself to the content store
+	if len(manifestBytes) == 0 {
+		log.Println("manifest bytes empty; skipping manifest write")
+	} else {
+		manifestDigest := digest.FromBytes(manifestBytes)
+		ref := fmt.Sprintf("docker.io/%s@%s", "library/alpine", manifestDigest)
+		log.Printf("Writing manifest blob to content store: ref=%s mediaType=%s size=%d", ref, mediaType, len(manifestBytes))
+
+		w, err := content.OpenWriter(ctx, cs, content.WithRef(ref), content.WithDescriptor(v1.Descriptor{
+			MediaType: mediaType,
+			Digest:    manifestDigest,
+			Size:      int64(len(manifestBytes)),
+		}))
+		if err != nil {
+			if errdefs.IsAlreadyExists(err) {
+				log.Printf("Manifest %s already exists in content store; skipping", manifestDigest)
+			} else {
+				log.Printf("Error opening writer for manifest %s: %v", manifestDigest, err)
+			}
+		} else {
+			defer func() {
+				if cerr := w.Close(); cerr != nil {
+					log.Printf("error closing manifest writer: %v", cerr)
+				}
+			}()
+			if _, err := w.Write(manifestBytes); err != nil {
+				_ = w.Close()
+				cs.Abort(ctx, ref)
+				log.Printf("Error writing manifest bytes: %v", err)
+			} else {
+				if err := w.Commit(ctx, int64(len(manifestBytes)), manifestDigest); err != nil {
+					if errdefs.IsAlreadyExists(err) {
+						log.Printf("Manifest %s already exists (commit)", manifestDigest)
+					} else {
+						log.Printf("Failed to commit manifest %s: %v", manifestDigest, err)
+					}
+				} else {
+					log.Printf("Successfully committed manifest %s", manifestDigest)
+				}
+			}
 		}
 	}
 }
@@ -198,7 +275,7 @@ func getTokenFromWWW(www, repo, action string) (string, error) {
 		return "", fmt.Errorf("realm missing in WWW-Authenticate")
 	}
 
-	u, err := url.Parse(realm)
+	u, err := neturl.Parse(realm)
 	if err != nil {
 		return "", err
 	}
@@ -217,7 +294,11 @@ func getTokenFromWWW(www, repo, action string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if cerr := resp.Body.Close(); cerr != nil {
+			log.Printf("error closing token response body: %v", cerr)
+		}
+	}()
 
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(resp.Body)
@@ -237,7 +318,7 @@ func getTokenFromWWW(www, repo, action string) (string, error) {
 	return "", fmt.Errorf("no token in response")
 }
 
-func FetchManifest(token, imageName, tag string) (configDigest string, layerDigests []digest.Digest, mediaType string, err error) {
+func FetchManifest(token, imageName, tag string) (config Descriptor, layerDescs []Descriptor, manifestBytes []byte, mediaType string, err error) {
 	accept := strings.Join([]string{
 		mediaManifestList,
 		mediaOCIIndex,
@@ -247,8 +328,8 @@ func FetchManifest(token, imageName, tag string) (configDigest string, layerDige
 
 	// helper to GET a manifest (by ref or digest) and return body + content-type
 	get := func(ref string) (body []byte, contentType string, err error) {
-		url := "https://" + defaultUrl + "/v2/" + imageName + "/manifests/" + ref
-		req, err := http.NewRequest("GET", url, nil)
+		manifestURL := "https://" + defaultUrl + "/v2/" + imageName + "/manifests/" + ref
+		req, err := http.NewRequest("GET", manifestURL, nil)
 		if err != nil {
 			return nil, "", err
 		}
@@ -261,7 +342,11 @@ func FetchManifest(token, imageName, tag string) (configDigest string, layerDige
 		if err != nil {
 			return nil, "", err
 		}
-		defer resp.Body.Close()
+		defer func() {
+			if cerr := resp.Body.Close(); cerr != nil {
+				log.Printf("error closing manifest response body: %v", cerr)
+			}
+		}()
 		if resp.StatusCode != http.StatusOK {
 			b, _ := io.ReadAll(resp.Body)
 			return nil, "", fmt.Errorf("manifest request failed: %s %s", resp.Status, strings.TrimSpace(string(b)))
@@ -273,14 +358,14 @@ func FetchManifest(token, imageName, tag string) (configDigest string, layerDige
 
 	b, ct, err := get(tag)
 	if err != nil {
-		return "", nil, "", err
+		return Descriptor{}, nil, nil, "", err
 	}
 	ct = strings.ToLower(ct)
 
 	if strings.Contains(ct, "manifest.list") || strings.Contains(ct, "index") {
 		var idx Index
 		if err := json.Unmarshal(b, &idx); err != nil {
-			return "", nil, "", fmt.Errorf("failed to decode index: %w", err)
+			return Descriptor{}, nil, nil, "", fmt.Errorf("failed to decode index: %w", err)
 		}
 
 		targetOS := runtime.GOOS
@@ -357,35 +442,37 @@ func FetchManifest(token, imageName, tag string) (configDigest string, layerDige
 		}
 
 		if chosen == nil {
-			return "", nil, "", fmt.Errorf("no matching manifest for platform %s/%s", targetOS, targetArch)
+			return Descriptor{}, nil, nil, "", fmt.Errorf("no matching manifest for platform %s/%s", targetOS, targetArch)
 		}
 
 		log.Printf("Selected manifest from index: digest=%s mediaType=%s", chosen.Digest, chosen.MediaType)
 
 		b, ct, err = get(string(chosen.Digest))
 		if err != nil {
-			return "", nil, "", err
+			return Descriptor{}, nil, nil, "", err
 		}
 	}
 
 	// Parse manifest (single image manifest)
 	var m Manifest
 	if err := json.Unmarshal(b, &m); err != nil {
-		return "", nil, "", fmt.Errorf("failed to decode manifest: %w", err)
+		return Descriptor{}, nil, nil, "", fmt.Errorf("failed to decode manifest: %w", err)
 	}
 
 	if m.Config.Digest == "" {
-		return "", nil, "", fmt.Errorf("manifest has no config digest")
+		return Descriptor{}, nil, nil, "", fmt.Errorf("manifest has no config digest")
 	}
 
-	configDigest = string(m.Config.Digest)
-	layerDigests = make([]digest.Digest, 0, len(m.Layers))
+	config = m.Config
+	layerDescs = make([]Descriptor, 0, len(m.Layers))
 	for _, l := range m.Layers {
 		if l.Digest != "" {
-			layerDigests = append(layerDigests, l.Digest)
+			layerDescs = append(layerDescs, l)
 		}
 	}
-	return configDigest, layerDigests, mediaType, nil
+	manifestBytes = b
+	mediaType = strings.ToLower(ct)
+	return config, layerDescs, manifestBytes, mediaType, nil
 }
 
 // progressReader wraps a reader and logs progress periodically.
@@ -431,7 +518,11 @@ func fetchAndStreamBlob(ctx context.Context, cs content.Store, token, imageName 
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if cerr := resp.Body.Close(); cerr != nil {
+			log.Printf("error closing blob response body: %v", cerr)
+		}
+	}()
 
 	log.Printf("blob response status: %s", resp.Status)
 	for k, v := range resp.Header {
@@ -457,6 +548,9 @@ func fetchAndStreamBlob(ctx context.Context, cs content.Store, token, imageName 
 		}
 	}
 
+	// wrap body with progress reader to provide periodic updates
+	pr := &progressReader{r: resp.Body, dgst: dgst}
+
 	writer, err := content.OpenWriter(ctx, cs, content.WithRef(ref), content.WithDescriptor(v1.Descriptor{
 		MediaType: mediaType,
 		Digest:    dgst,
@@ -472,11 +566,15 @@ func fetchAndStreamBlob(ctx context.Context, cs content.Store, token, imageName 
 		return err
 	}
 
-	defer writer.Close()
+	defer func() {
+		if cerr := writer.Close(); cerr != nil {
+			log.Printf("error closing writer for %s: %v", dgst, cerr)
+		}
+	}()
 
-	n, err := io.Copy(writer, resp.Body)
+	n, err := io.Copy(writer, pr)
 	if err != nil {
-		writer.Close()
+		_ = writer.Close()
 		cs.Abort(ctx, ref)
 		return fmt.Errorf("failed to copy data for %s: %w", dgst, err)
 	}
@@ -492,40 +590,4 @@ func fetchAndStreamBlob(ctx context.Context, cs content.Store, token, imageName 
 	}
 	log.Printf("Successfully committed blob %s to content store", dgst)
 	return nil
-}
-
-// Add this debug function to your code
-func debugContentStore(ctx context.Context, cs content.Store, dgst digest.Digest) {
-	log.Printf("=== Debug: Checking content store for %s ===", dgst)
-
-	// Method 1: Direct Info lookup
-	info, err := cs.Info(ctx, dgst)
-	if err != nil {
-		log.Printf("Direct Info lookup failed: %v", err)
-	} else {
-		log.Printf("Direct Info lookup SUCCESS: %+v", info)
-	}
-
-	// Method 2: Walk all content
-	log.Printf("Walking all content in store:")
-	err = cs.Walk(ctx, func(info content.Info) error {
-		if info.Digest == dgst {
-			log.Printf("FOUND via Walk: %+v", info)
-		}
-		return nil
-	})
-	if err != nil {
-		log.Printf("Walk failed: %v", err)
-	}
-
-	// Method 3: Check ReaderAt (tests if blob is readable)
-	ra, err := cs.ReaderAt(ctx, v1.Descriptor{Digest: dgst})
-	if err != nil {
-		log.Printf("ReaderAt failed: %v", err)
-	} else {
-		log.Printf("ReaderAt SUCCESS: size=%d", ra.Size())
-		ra.Close()
-	}
-
-	log.Printf("=== End debug ===")
 }
