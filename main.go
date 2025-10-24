@@ -273,8 +273,20 @@ func main() {
 			log.Printf("Error retrieving image from containerd: %v", err)
 		}
 
-		container, err := containerdClient.NewContainer(ctx, "my-alpine-container", containerd.WithImage(image),
-			containerd.WithNewSnapshot("snap1", image), containerd.WithNewSpec(oci.WithImageConfig(image), oci.WithProcessArgs("/bin/sh")))
+		if err := image.Unpack(ctx, ""); err != nil {
+			log.Fatalf("Error unpacking image: %v", err)
+		}
+		log.Println("Image unpacked successfully!")
+
+		container, err := containerdClient.NewContainer(
+			ctx,
+			"my-alpine-container",
+			containerd.WithNewSnapshot("my-alpine-container-snap", image),
+			containerd.WithNewSpec(
+				oci.WithImageConfig(image),
+				oci.WithProcessArgs("/bin/sh", "-c", "echo hello && sleep 30"),
+			),
+		)
 
 		if err != nil {
 			log.Printf("Error creating container: %v", err)
