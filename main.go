@@ -78,7 +78,6 @@ func generateShortID() string {
 
 func main() {
 
-	registry := flag.String("registry", "registry-1.docker.io", "Docker registry URL")
 	image := flag.String("image", "", "Image name (e.g., library/alpine)")
 	tag := flag.String("tag", "latest", "Image tag")
 	flag.Parse()
@@ -87,7 +86,7 @@ func main() {
 		log.Fatal("image is required")
 	}
 
-	defaultUrl = *registry
+	defaultUrl = "registry-1.docker.io"
 
 	var ctx = context.Background()
 	ctxWithNamespace := namespaces.WithNamespace(ctx, "default")
@@ -190,7 +189,7 @@ func main() {
 
 		// Not found -> fetch
 		log.Printf("Content info for %s not found locally. Proceeding to fetch.", entry.Digest)
-		if err := fetchAndStreamBlob(ctx, cs, token, *registry, *image, entry.Digest, entry.MediaType); err != nil {
+		if err := fetchAndStreamBlob(ctx, cs, token, *image, entry.Digest, entry.MediaType); err != nil {
 			log.Printf("Error fetching and streaming blob %s: %v", entry.Digest, err)
 			continue
 		}
@@ -219,7 +218,7 @@ func main() {
 			if cfgMT == "" {
 				cfgMT = "application/vnd.oci.image.config.v1+json"
 			}
-			if err := fetchAndStreamBlob(ctx, cs, token, *registry, *image, configDesc.Digest, cfgMT); err != nil {
+			if err := fetchAndStreamBlob(ctx, cs, token, *image, configDesc.Digest, cfgMT); err != nil {
 				log.Printf("Error fetching config blob %s: %v", configDesc.Digest, err)
 			} else {
 				info, _ := cs.Info(ctx, configDesc.Digest)
@@ -233,7 +232,7 @@ func main() {
 		log.Println("manifest bytes empty; skipping manifest write")
 	} else {
 		manifestDigest := digest.FromBytes(manifestBytes)
-		fullImageName := fmt.Sprintf("%s/%s", *registry, *image)
+		fullImageName := fmt.Sprintf("registry-1.docker.io/%s", *image)
 		ref := fmt.Sprintf("%s@%s", fullImageName, manifestDigest)
 		log.Printf("Writing manifest blob to content store: ref=%s mediaType=%s size=%d", ref, mediaType, len(manifestBytes))
 
@@ -589,8 +588,8 @@ func (p *progressReader) Read(b []byte) (int, error) {
 }
 
 // imageName should be the repository name (e.g. "library/alpine").
-func fetchAndStreamBlob(ctx context.Context, cs content.Store, token, registry, imageName string, dgst digest.Digest, mediaType string) error {
-	blobUrl := "https://" + registry + "/v2/" + imageName + "/blobs/" + dgst.String()
+func fetchAndStreamBlob(ctx context.Context, cs content.Store, token, imageName string, dgst digest.Digest, mediaType string) error {
+	blobUrl := "https://" + defaultUrl + "/v2/" + imageName + "/blobs/" + dgst.String()
 	log.Printf("fetchAndStreamBlob: GET %s (image=%s digest=%s)", blobUrl, imageName, dgst)
 	req, err := http.NewRequest("GET", blobUrl, nil)
 	if err != nil {
@@ -625,7 +624,7 @@ func fetchAndStreamBlob(ctx context.Context, cs content.Store, token, registry, 
 		return fmt.Errorf("blob GET %s: %s %s", dgst.String(), resp.Status, strings.TrimSpace(string(b)))
 	}
 
-	ref := fmt.Sprintf("%s/%s@%s", registry, imageName, dgst.String())
+	ref := fmt.Sprintf("registry-1.docker.io/%s@%s", imageName, dgst.String())
 	contentLength := resp.Header.Get("Content-Length")
 	var expectedSize int64
 	if contentLength == "" {
