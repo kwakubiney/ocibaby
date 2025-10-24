@@ -11,6 +11,7 @@ import (
 	"github.com/containerd/containerd"
 	"github.com/containerd/containerd/content"
 	"github.com/containerd/containerd/errdefs"
+	"github.com/containerd/containerd/images"
 	"github.com/containerd/containerd/namespaces"
 	"github.com/opencontainers/go-digest"
 	v1 "github.com/opencontainers/image-spec/specs-go/v1"
@@ -210,11 +211,12 @@ func main() {
 		ref := fmt.Sprintf("docker.io/%s@%s", "library/alpine", manifestDigest)
 		log.Printf("Writing manifest blob to content store: ref=%s mediaType=%s size=%d", ref, mediaType, len(manifestBytes))
 
-		w, err := content.OpenWriter(ctx, cs, content.WithRef(ref), content.WithDescriptor(v1.Descriptor{
+		manifestDescriptor := v1.Descriptor{
 			MediaType: mediaType,
 			Digest:    manifestDigest,
 			Size:      int64(len(manifestBytes)),
-		}))
+		}
+		w, err := content.OpenWriter(ctx, cs, content.WithRef(ref), content.WithDescriptor(manifestDescriptor))
 		if err != nil {
 			if errdefs.IsAlreadyExists(err) {
 				log.Printf("Manifest %s already exists in content store; skipping", manifestDigest)
@@ -242,6 +244,11 @@ func main() {
 					log.Printf("Successfully committed manifest %s", manifestDigest)
 				}
 			}
+		}
+
+		err = registerImage(ctx, containerdClient, manifestDescriptor, "docker.io/library/alpine")
+		if err != nil {
+			log.Printf("Error registering image in containerd: %v", err)
 		}
 	}
 }
@@ -589,5 +596,26 @@ func fetchAndStreamBlob(ctx context.Context, cs content.Store, token, imageName 
 		return fmt.Errorf("failed to commit %s: %w", dgst, err)
 	}
 	log.Printf("Successfully committed blob %s to content store", dgst)
+	return nil
+}
+
+func registerImage(
+	ctx context.Context,
+	client *containerd.Client,
+	manifestDesc v1.Descriptor,
+	imageName string) error {
+	img := images.Image{
+		Name:   imageName,
+		Target: manifestDesc,
+	}
+
+	_, err := client.ImageService().Create(ctx, img)
+	if err != nil {
+		if errdefs.IsAlreadyExists(err) {
+			log.Printf("Image %s already registered in containerd", imageName)
+			_, err := client.ImageService().Update(ctx, img)
+			return err
+		}
+	}
 	return nil
 }
