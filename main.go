@@ -81,7 +81,6 @@ func main() {
 	registry := flag.String("registry", "registry-1.docker.io", "Docker registry URL")
 	image := flag.String("image", "", "Image name (e.g., library/alpine)")
 	tag := flag.String("tag", "latest", "Image tag")
-	name := flag.String("name", "", "Container name (optional, stored as metadata)")
 	flag.Parse()
 
 	if *image == "" {
@@ -164,7 +163,6 @@ func main() {
 	manifestDigest := digest.FromBytes(manifestBytes)
 	containerID := generateShortID()
 	snapshotKey := fmt.Sprintf("sha256:%s-%s", manifestDigest, generateShortID())
-	userName := *name
 
 	fmt.Println("Config digest:", configDesc.Digest)
 	fmt.Println("Layers:")
