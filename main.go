@@ -153,12 +153,12 @@ func main() {
 
 		// Not found -> fetch
 		log.Printf("Content info for %s not found locally. Proceeding to fetch.", entry)
+		debugContentStore(ctx, containerdClient.ContentStore(), entry)
 		if err := fetchAndStreamBlob(ctx, containerdClient.ContentStore(), token, "library/alpine", entry, mediaType); err != nil {
 			log.Printf("Error fetching and streaming blob %s: %v", entry, err)
 			continue
 		}
-
-		// Verify it was written
+		debugContentStore(ctx, containerdClient.ContentStore(), entry)
 		info, err = containerdClient.ContentStore().Info(ctx, entry)
 		if err != nil {
 			log.Printf("Fetch succeeded but Info failed for %s: %v", entry, err)
@@ -492,4 +492,40 @@ func fetchAndStreamBlob(ctx context.Context, cs content.Store, token, imageName 
 	}
 	log.Printf("Successfully committed blob %s to content store", dgst)
 	return nil
+}
+
+// Add this debug function to your code
+func debugContentStore(ctx context.Context, cs content.Store, dgst digest.Digest) {
+	log.Printf("=== Debug: Checking content store for %s ===", dgst)
+
+	// Method 1: Direct Info lookup
+	info, err := cs.Info(ctx, dgst)
+	if err != nil {
+		log.Printf("Direct Info lookup failed: %v", err)
+	} else {
+		log.Printf("Direct Info lookup SUCCESS: %+v", info)
+	}
+
+	// Method 2: Walk all content
+	log.Printf("Walking all content in store:")
+	err = cs.Walk(ctx, func(info content.Info) error {
+		if info.Digest == dgst {
+			log.Printf("FOUND via Walk: %+v", info)
+		}
+		return nil
+	})
+	if err != nil {
+		log.Printf("Walk failed: %v", err)
+	}
+
+	// Method 3: Check ReaderAt (tests if blob is readable)
+	ra, err := cs.ReaderAt(ctx, v1.Descriptor{Digest: dgst})
+	if err != nil {
+		log.Printf("ReaderAt failed: %v", err)
+	} else {
+		log.Printf("ReaderAt SUCCESS: size=%d", ra.Size())
+		ra.Close()
+	}
+
+	log.Printf("=== End debug ===")
 }
