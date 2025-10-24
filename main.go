@@ -191,6 +191,7 @@ func main() {
 		} else {
 			log.Printf("Config %s not found locally. Fetching...", configDesc.Digest)
 			cfgMT := configDesc.MediaType
+			log.Printf("Config media type: %s", cfgMT)
 			if cfgMT == "" {
 				cfgMT = "application/vnd.oci.image.config.v1+json"
 			}
@@ -243,6 +244,15 @@ func main() {
 				} else {
 					log.Printf("Successfully committed manifest %s", manifestDigest)
 				}
+			}
+
+			childDigests := []digest.Digest{configDesc.Digest}
+			for _, layer := range layers {
+				childDigests = append(childDigests, layer.Digest)
+			}
+
+			if err := updateContentLabels(ctx, cs, manifestDigest, childDigests); err != nil {
+				log.Printf("Warning: failed to update GC labels for manifest: %v", err)
 			}
 		}
 
@@ -586,9 +596,7 @@ func fetchAndStreamBlob(ctx context.Context, cs content.Store, token, imageName 
 		return fmt.Errorf("failed to copy data for %s: %w", dgst, err)
 	}
 
-	if err := writer.Commit(ctx, n, dgst, content.WithLabels(map[string]string{
-		"containerd.io/gc.ref.content.0": dgst.String(),
-	})); err != nil {
+	if err := writer.Commit(ctx, n, dgst); err != nil {
 		if errdefs.IsAlreadyExists(err) {
 			log.Printf("Content %s already exists (caught during Commit)", dgst)
 			return nil
@@ -617,5 +625,34 @@ func registerImage(
 			return err
 		}
 	}
+	return nil
+}
+
+func updateContentLabels(ctx context.Context, cs content.Store, parentDigest digest.Digest, childDigests []digest.Digest) error {
+	labels := make(map[string]string)
+	for i, child := range childDigests {
+		labelKey := fmt.Sprintf("containerd.io/gc.ref.content.%d", i)
+		labels[labelKey] = child.String()
+	}
+
+	info, err := cs.Info(ctx, parentDigest)
+	if err != nil {
+		return fmt.Errorf("failed to get info for parent %s: %w", parentDigest, err)
+	}
+
+	if info.Labels == nil {
+		info.Labels = labels
+	} else {
+		for k, v := range labels {
+			info.Labels[k] = v
+		}
+	}
+
+	_, err = cs.Update(ctx, info, "labels")
+	if err != nil {
+		return fmt.Errorf("failed to update labels for %s: %w", parentDigest, err)
+	}
+
+	log.Printf("Updated GC labels for %s: %d children referenced", parentDigest, len(childDigests))
 	return nil
 }
