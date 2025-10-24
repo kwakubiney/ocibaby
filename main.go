@@ -9,10 +9,12 @@ import (
 	"time"
 
 	"github.com/containerd/containerd"
+	"github.com/containerd/containerd/cio"
 	"github.com/containerd/containerd/content"
 	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/images"
 	"github.com/containerd/containerd/namespaces"
+	"github.com/containerd/containerd/oci"
 	"github.com/opencontainers/go-digest"
 	v1 "github.com/opencontainers/image-spec/specs-go/v1"
 
@@ -78,10 +80,13 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// handle possible error returned by done
+	// track whether we've already called done(ctx) so we don't call it twice
+	leaseDone := false
 	defer func() {
-		if derr := done(ctx); derr != nil {
-			log.Printf("lease done error: %v", derr)
+		if !leaseDone {
+			if derr := done(ctx); derr != nil {
+				log.Printf("lease done error: %v", derr)
+			}
 		}
 	}()
 
@@ -232,7 +237,9 @@ func main() {
 			}()
 			if _, err := w.Write(manifestBytes); err != nil {
 				_ = w.Close()
-				cs.Abort(ctx, ref)
+				if aerr := cs.Abort(ctx, ref); aerr != nil {
+					log.Printf("error aborting manifest write (ref=%s): %v", ref, aerr)
+				}
 				log.Printf("Error writing manifest bytes: %v", err)
 			} else {
 				if err := w.Commit(ctx, int64(len(manifestBytes)), manifestDigest); err != nil {
@@ -259,6 +266,64 @@ func main() {
 		err = registerImage(ctx, containerdClient, manifestDescriptor, "docker.io/library/alpine")
 		if err != nil {
 			log.Printf("Error registering image in containerd: %v", err)
+		}
+
+		image, err := containerdClient.GetImage(ctx, "docker.io/library/alpine")
+		if err != nil {
+			log.Printf("Error retrieving image from containerd: %v", err)
+		}
+
+		container, err := containerdClient.NewContainer(ctx, "my-alpine-container", containerd.WithImage(image),
+			containerd.WithSnapshot("snap1"), containerd.WithNewSpec(oci.WithImageConfig(image), oci.WithProcessArgs("/bin/sh")))
+
+		if err != nil {
+			log.Printf("Error creating container: %v", err)
+		}
+
+		task, err := container.NewTask(ctx, cio.NewCreator(cio.WithStdio))
+		if err != nil {
+			log.Printf("Error creating task from container: %v", err)
+		}
+
+		if err := task.Start(ctx); err != nil {
+			log.Printf("Error starting task: %v", err)
+		}
+
+		exitChan, err := task.Wait(ctx)
+		if err != nil {
+			log.Printf("Error waiting on task: %v", err)
+		} else {
+			exitCodeCh := make(chan int, 1)
+			go func() {
+				select {
+				case status, ok := <-exitChan:
+					if !ok {
+						log.Printf("exit channel closed without a status")
+						exitCodeCh <- 1
+						return
+					}
+					code, _, err := status.Result()
+					if err != nil {
+						log.Printf("Error getting task result: %v", err)
+						exitCodeCh <- 1
+						return
+					}
+					log.Printf("Task exited with status: %d", code)
+					exitCodeCh <- int(code)
+				case <-ctx.Done():
+					log.Printf("Context canceled while waiting for task: %v", ctx.Err())
+					exitCodeCh <- 1
+				}
+			}()
+			code := <-exitCodeCh
+			if !leaseDone {
+				if derr := done(ctx); derr != nil {
+					log.Printf("lease done error: %v", derr)
+				}
+				leaseDone = true
+			}
+			log.Printf("Exiting process with code: %d", code)
+			os.Exit(code)
 		}
 	}
 }
@@ -393,7 +458,6 @@ func FetchManifest(token, imageName, tag string) (config Descriptor, layerDescs 
 			targetOS = "linux"
 		}
 
-		// arch aliases to handle variations like aarch64 vs arm64
 		tarchAliases := func(a string) []string {
 			switch a {
 			case "arm64":
@@ -470,7 +534,6 @@ func FetchManifest(token, imageName, tag string) (config Descriptor, layerDescs 
 		}
 	}
 
-	// Parse manifest (single image manifest)
 	var m Manifest
 	if err := json.Unmarshal(b, &m); err != nil {
 		return Descriptor{}, nil, nil, "", fmt.Errorf("failed to decode manifest: %w", err)
@@ -492,7 +555,6 @@ func FetchManifest(token, imageName, tag string) (config Descriptor, layerDescs 
 	return config, layerDescs, manifestBytes, mediaType, nil
 }
 
-// progressReader wraps a reader and logs progress periodically.
 type progressReader struct {
 	r     io.Reader
 	dgst  digest.Digest
@@ -512,7 +574,6 @@ func (p *progressReader) Read(b []byte) (int, error) {
 	return n, err
 }
 
-// Call this from the loop where you currently have the TODO.
 // imageName should be the repository name (e.g. "library/alpine").
 func fetchAndStreamBlob(ctx context.Context, cs content.Store, token, imageName string, dgst digest.Digest, mediaType string) error {
 	blobUrl := "https://" + defaultUrl + "/v2/" + imageName + "/blobs/" + dgst.String()
@@ -592,7 +653,9 @@ func fetchAndStreamBlob(ctx context.Context, cs content.Store, token, imageName 
 	n, err := io.Copy(writer, pr)
 	if err != nil {
 		_ = writer.Close()
-		cs.Abort(ctx, ref)
+		if aerr := cs.Abort(ctx, ref); aerr != nil {
+			log.Printf("error aborting blob write (ref=%s): %v", ref, aerr)
+		}
 		return fmt.Errorf("failed to copy data for %s: %w", dgst, err)
 	}
 
